@@ -14,5 +14,10 @@ BLOCKED_EXTENSIONS = {'exe', 'sh', 'bat', 'cmd', 'ps1', 'py', 'php', 'jsp', 'cgi
 SHARE_LINK_EXPIRE_HOURS = int(os.getenv('SHARE_LINK_EXPIRE_HOURS', 24))
 SHARE_LINK_MAX_DOWNLOADS = int(os.getenv('SHARE_LINK_MAX_DOWNLOADS', 10))
 
+# 下载票（受控下载凭证）有效期：传输中每次续传会滑动续期
+DOWNLOAD_TICKET_TTL_SECONDS = int(os.getenv('DOWNLOAD_TICKET_TTL_SECONDS', 1800))
+# 分块传输时落盘检查点的最小间隔（秒）
+DOWNLOAD_CHECKPOINT_INTERVAL = float(os.getenv('DOWNLOAD_CHECKPOINT_INTERVAL', '0.5'))
+
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)

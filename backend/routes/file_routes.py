@@ -10,6 +10,12 @@ from routes import files_bp
 from database import get_db
 from auth import verify_token, get_username_from_token, login_required
 from config import UPLOAD_FOLDER, MAX_FILE_SIZE, BLOCKED_EXTENSIONS, SHARE_LINK_EXPIRE_HOURS, SHARE_LINK_MAX_DOWNLOADS
+from download_sessions import (
+    ACTIVE_STATUSES,
+    create_session, get_session, effective_status, check_file_snapshot,
+    mark_transferring, fail_session, complete_session,
+    list_recent_sessions, cleanup_expired_sessions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -145,15 +151,17 @@ def is_share_valid(share):
 
 
 def increment_download_count(share_id):
-    """增加下载次数"""
+    """原子增加下载次数（不超过 max_downloads），返回是否成功"""
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute(
-        'UPDATE share_links SET download_count = download_count + 1 WHERE id = ?',
-        (share_id,)
-    )
+    cursor.execute('''
+        UPDATE share_links SET download_count = download_count + 1
+        WHERE id = ? AND (max_downloads IS NULL OR download_count < max_downloads)
+    ''', (share_id,))
+    success = cursor.rowcount > 0
     conn.commit()
     conn.close()
+    return success
 
 
 def get_token_from_request():
@@ -278,7 +286,8 @@ def download_by_share(share_id):
     if not os.path.exists(file_info['path']):
         return jsonify({'error': '文件不存在'}), 404
 
-    increment_download_count(share_id)
+    if not increment_download_count(share_id):
+        return jsonify({'error': '分享链接下载次数已用完'}), 404
 
     logger.info(f"分享下载: 文件 {file_info['name']}, 分享ID {share_id}, 下载次数 {share['download_count'] + 1}")
     return send_file(file_info['path'], as_attachment=True, download_name=file_info['name'])
@@ -349,3 +358,235 @@ def delete_share(share_id):
 
     logger.info(f"分享链接删除: 分享ID {share_id}, 文件ID {share['file_id']}, 操作者 {username}")
     return jsonify({'success': True, 'message': '分享链接已删除'})
+
+
+# ---------- 受控下载会话 ----------
+
+def _get_file_record(file_id):
+    """获取文件记录"""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, name, path, size FROM files WHERE id = ?', (file_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+
+def _validate_file_on_disk(file_info):
+    """校验文件路径合法且存在于磁盘"""
+    if not file_info:
+        return '文件不存在', 404
+    if not os.path.abspath(file_info['path']).startswith(os.path.abspath(UPLOAD_FOLDER)):
+        return '非法文件路径', 403
+    if not os.path.exists(file_info['path']):
+        return '文件不存在', 404
+    return None, None
+
+
+def _session_payload(session):
+    """会话的对外表示"""
+    return {
+        'session_id': session['id'],
+        'file_id': session['file_id'],
+        'share_id': session['share_id'],
+        'status': effective_status(session),
+        'filename': session['file_name'],
+        'size': session['file_size'],
+        'mtime': session['file_mtime'],
+        'bytes_confirmed': session['bytes_confirmed'],
+        'failure_reason': session['failure_reason'],
+        'created_at': session['created_at'],
+        'expires_at': session['expires_at'],
+        'completed_at': session['completed_at'],
+    }
+
+
+@files_bp.route('/api/download/<file_id>/prepare', methods=['POST'])
+@login_required
+def prepare_download(file_id):
+    """创建受控下载会话（登录用户）"""
+    cleanup_expired_sessions()
+
+    file_info = _get_file_record(file_id)
+    error, status = _validate_file_on_disk(file_info)
+    if error:
+        return jsonify({'error': error}), status
+
+    token = get_token_from_request()
+    username = get_username_from_token(token)
+
+    stat = os.stat(file_info['path'])
+    session = create_session(
+        file_id=file_id,
+        file_name=file_info['name'],
+        file_size=stat.st_size,
+        file_mtime=stat.st_mtime,
+        username=username,
+    )
+    return jsonify(_session_payload(session))
+
+
+@files_bp.route('/api/share/<share_id>/download/prepare', methods=['POST'])
+def prepare_share_download(share_id):
+    """创建分享下载会话（公开；此时不占用下载次数，确认完成后才计数）"""
+    cleanup_expired_sessions()
+
+    share = get_share_link_info(share_id)
+    valid, error_msg = is_share_valid(share)
+    if not valid:
+        return jsonify({'error': error_msg}), 404
+
+    file_info = _get_file_record(share['file_id'])
+    error, status = _validate_file_on_disk(file_info)
+    if error:
+        return jsonify({'error': error}), status
+
+    stat = os.stat(file_info['path'])
+    session = create_session(
+        file_id=share['file_id'],
+        file_name=file_info['name'],
+        file_size=stat.st_size,
+        file_mtime=stat.st_mtime,
+        share_id=share_id,
+    )
+    return jsonify(_session_payload(session))
+
+
+@files_bp.route('/api/downloads/recent', methods=['GET'])
+@login_required
+def recent_downloads():
+    """当前用户最近的下载会话（历史状态，返回列表页后仍可展示最近结果）"""
+    token = get_token_from_request()
+    username = get_username_from_token(token)
+    sessions = list_recent_sessions(username)
+    return jsonify([
+        {
+            'session_id': s['id'],
+            'file_id': s['file_id'],
+            'share_id': s['share_id'],
+            'status': s['status'],
+            'filename': s['file_name'],
+            'size': s['file_size'],
+            'bytes_confirmed': s['bytes_confirmed'],
+            'failure_reason': s['failure_reason'],
+            'created_at': s['created_at'],
+            'updated_at': s['updated_at'],
+            'completed_at': s['completed_at'],
+        }
+        for s in sessions
+    ])
+
+
+@files_bp.route('/api/downloads/<session_id>', methods=['GET'])
+def get_download_session(session_id):
+    """查询下载会话状态（页面刷新后据此恢复，避免重复取件或错误完成状态）"""
+    session = get_session(session_id)
+    if not session:
+        return jsonify({'error': '下载会话不存在'}), 404
+    return jsonify(_session_payload(session))
+
+
+def _check_session_transferable(session):
+    """校验会话当前是否允许传输，返回 (error_dict, status) 或 (None, None)"""
+    status = effective_status(session)
+    if status == 'expired':
+        return {'error': '下载会话已过期，请重新发起下载', 'code': 'session_expired'}, 410
+    if status == 'failed':
+        return {'error': session['failure_reason'] or '下载会话已失败', 'code': 'session_failed'}, 409
+    if status == 'completed':
+        # 已完成会话不再提供内容，防止绕过下载次数限制反复取件
+        return {'error': '下载会话已完成，如需再次下载请重新发起', 'code': 'session_completed'}, 409
+    return None, None
+
+
+def _check_session_file(session):
+    """校验会话对应的文件记录与磁盘快照（检测文件被替换）"""
+    file_info = _get_file_record(session['file_id'])
+    if not file_info:
+        fail_session(session['id'], '文件记录不存在')
+        return None, {'error': '文件不存在', 'code': 'file_missing'}, 404
+    if not os.path.abspath(file_info['path']).startswith(os.path.abspath(UPLOAD_FOLDER)):
+        fail_session(session['id'], '非法文件路径')
+        return None, {'error': '非法文件路径', 'code': 'invalid_path'}, 403
+    ok, code = check_file_snapshot(session, file_info['path'])
+    if not ok:
+        if code == 'file_missing':
+            fail_session(session['id'], '文件已被删除')
+            return None, {'error': '文件不存在', 'code': 'file_missing'}, 404
+        fail_session(session['id'], '文件已被替换')
+        return None, {'error': '文件已被替换，请重新确认后再下载', 'code': 'file_changed'}, 409
+    return file_info, None, None
+
+
+@files_bp.route('/api/downloads/<session_id>/content', methods=['GET'])
+def download_session_content(session_id):
+    """传输会话内容（支持 Range 断点续传，网络波动后可从已接收位置继续）"""
+    session = get_session(session_id)
+    if not session:
+        return jsonify({'error': '下载会话不存在'}), 404
+
+    error, status = _check_session_transferable(session)
+    if error:
+        return jsonify(error), status
+
+    file_info, error, status = _check_session_file(session)
+    if error:
+        return jsonify(error), status
+
+    mark_transferring(session_id)
+
+    logger.info(f"会话传输: {session_id} 文件 {file_info['name']} "
+                f"(Range: {request.headers.get('Range', '全量')})")
+    # conditional=True 使 Flask 处理 Range 头并返回 206 / Accept-Ranges
+    return send_file(
+        file_info['path'],
+        as_attachment=True,
+        download_name=file_info['name'],
+        conditional=True,
+        max_age=0,
+    )
+
+
+@files_bp.route('/api/downloads/<session_id>/complete', methods=['POST'])
+def complete_download_session_endpoint(session_id):
+    """确认下载完成（幂等；分享下载在此刻才计入成功次数）"""
+    session = get_session(session_id)
+    if not session:
+        return jsonify({'error': '下载会话不存在'}), 404
+
+    was_completed = session['status'] == 'completed'
+
+    # 活动状态的会话在确认前必须复核文件快照，防止文件被替换后产生错误完成状态
+    if effective_status(session) in ACTIVE_STATUSES:
+        _, error, status = _check_session_file(session)
+        if error:
+            return jsonify(error), status
+
+    data = request.get_json(silent=True) or {}
+    received = data.get('received')
+
+    result, error, status = complete_session(session_id, received)
+    if error:
+        return jsonify(error), status
+
+    return jsonify({
+        'success': True,
+        'session_id': result['id'],
+        'status': 'completed',
+        'completed_at': result['completed_at'],
+        'already_completed': was_completed,
+    })
+
+
+@files_bp.route('/api/downloads/<session_id>/abort', methods=['POST'])
+def abort_download_session(session_id):
+    """中止下载会话（用户取消或放弃重试）"""
+    session = get_session(session_id)
+    if not session:
+        return jsonify({'error': '下载会话不存在'}), 404
+
+    if effective_status(session) == 'completed':
+        return jsonify({'error': '下载会话已完成', 'code': 'session_completed'}), 409
+
+    fail_session(session_id, '用户取消下载')
+    return jsonify({'success': True, 'status': 'failed'})

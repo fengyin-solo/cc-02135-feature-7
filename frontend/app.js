@@ -76,7 +76,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         TokenManager.clear();
     }
     await updateUserBar();
-    loadFileList();
+    await loadFileList();
+    // 恢复各文件的下载状态（页面刷新后仍能看到最近结果）
+    restoreDownloadStates();
 });
 
 // 验证文件
@@ -167,18 +169,35 @@ async function loadFileList() {
         } else {
             fileList.innerHTML = files.map(file => `
                 <div class="file-item">
-                    <div class="file-info">
-                        <div class="file-icon">${getFileIcon(file.name)}</div>
-                        <div class="file-details">
-                            <div class="file-name">${escapeHtml(file.name)}</div>
-                            <div class="file-size">${formatSize(file.size)}</div>
+                    <div class="file-item-main">
+                        <div class="file-info">
+                            <div class="file-icon">${getFileIcon(file.name)}</div>
+                            <div class="file-details">
+                                <div class="file-name">${escapeHtml(file.name)}</div>
+                                <div class="file-size">${formatSize(file.size)}</div>
+                            </div>
+                        </div>
+                        <div class="file-actions">
+                            ${isLoggedIn ? `<button class="share-btn" onclick="openShareModal('${escapeHtml(file.id)}', '${escapeHtml(file.name)}')">分享</button>` : ''}
+                            <button class="download-btn" id="dl-btn-${escapeHtml(file.id)}" onclick="startFileDownload('${escapeHtml(file.id)}')">
+                                下载
+                            </button>
                         </div>
                     </div>
-                    <div class="file-actions">
-                        ${isLoggedIn ? `<button class="share-btn" onclick="openShareModal('${escapeHtml(file.id)}', '${escapeHtml(file.name)}')">分享</button>` : ''}
-                        <button class="download-btn" onclick="requestDownload('${escapeHtml(file.id)}')">
-                            下载
-                        </button>
+                    <div class="dl-badge" id="dl-badge-${escapeHtml(file.id)}" style="display:none"></div>
+                    <div class="dl-widget" id="dl-widget-${escapeHtml(file.id)}" style="display:none">
+                        <div class="dl-stages">
+                            <span class="dl-stage" data-stage="preparing">准备</span>
+                            <span class="dl-stage-arrow">→</span>
+                            <span class="dl-stage" data-stage="verifying">校验</span>
+                            <span class="dl-stage-arrow">→</span>
+                            <span class="dl-stage" data-stage="transferring">传输</span>
+                            <span class="dl-stage-arrow">→</span>
+                            <span class="dl-stage" data-stage="completed">完成</span>
+                        </div>
+                        <div class="dl-bar"><div class="dl-bar-fill"></div></div>
+                        <div class="dl-msg"></div>
+                        <button class="dl-retry-btn" style="display:none" onclick="startFileDownload('${escapeHtml(file.id)}')">重试下载</button>
                     </div>
                 </div>
             `).join('');
@@ -198,72 +217,52 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-// 请求下载 - 检查token是否有效，有效则直接下载
-async function requestDownload(fileId) {
-    showLoading('检查授权...');
-    
-    // 检查是否有有效的token
-    if (await TokenManager.isValid()) {
-        // token有效，使用 fetch + Authorization 头下载
-        document.getElementById('loadingText').textContent = '正在下载...';
-        try {
-            const response = await fetch(`${API_BASE}/download/${fileId}`, {
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${TokenManager.get()}`
-                }
-            });
-            if (response.ok) {
-                const blob = await response.blob();
-                const contentDisposition = response.headers.get('Content-Disposition');
-                let filename = 'download';
-                if (contentDisposition) {
-                    const match = contentDisposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';\n]+)/i);
-                    if (match) filename = decodeURIComponent(match[1]);
-                }
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = filename;
-                document.body.appendChild(a);
-                a.click();
-                window.URL.revokeObjectURL(url);
-                a.remove();
-            } else {
-                const result = await response.json();
-                alert(`下载失败: ${result.error || '未知错误'}`);
-            }
-        } catch (error) {
-            alert(`下载失败: ${error.message}`);
-        } finally {
-            hideLoading();
-        }
-        return;
+// 请求下载 - 启动受控下载流程（分阶段状态 + 断点续传）
+async function startFileDownload(fileId) {
+    if (DownloadManager.isActive('file', fileId)) return;  // 重复点击防护
+    hideRetryButton(fileId);
+    updateDownloadButton(fileId);
+    try {
+        await DownloadManager.start('file', fileId, createDownloadHooks(fileId));
+    } finally {
+        updateDownloadButton(fileId);
+        updateBadge(fileId);
     }
-    
-    // token无效或不存在，弹出登录框
-    hideLoading();
-    TokenManager.clear();
-    document.getElementById('downloadFileId').value = fileId;
-    document.getElementById('authModal').classList.add('active');
-    document.getElementById('authError').textContent = '';
-    document.getElementById('username').value = '';
-    document.getElementById('password').value = '';
-    document.getElementById('username').focus();
+}
+
+// 登录请求（Promise 化）：权限过期/未登录时引导用户重新确认身份
+let pendingAuthResolve = null;
+
+function requestLogin() {
+    return new Promise((resolve) => {
+        pendingAuthResolve = resolve;
+        document.getElementById('authError').textContent = '';
+        document.getElementById('username').value = '';
+        document.getElementById('password').value = '';
+        document.getElementById('authModal').classList.add('active');
+        document.getElementById('username').focus();
+    });
+}
+
+function resolvePendingAuth(result) {
+    if (pendingAuthResolve) {
+        pendingAuthResolve(result);
+        pendingAuthResolve = null;
+    }
 }
 
 // 关闭验证弹窗
 function closeAuthModal() {
     document.getElementById('authModal').classList.remove('active');
+    resolvePendingAuth(false);  // 用户取消登录，中止等待中的下载
 }
 
 // 身份验证表单提交
 document.getElementById('authForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    
+
     const username = document.getElementById('username').value.trim();
     const password = document.getElementById('password').value;
-    const fileId = document.getElementById('downloadFileId').value;
 
     if (!username || !password) {
         document.getElementById('authError').textContent = '请输入用户名和密码';
@@ -271,68 +270,33 @@ document.getElementById('authForm').addEventListener('submit', async (e) => {
     }
 
     showLoading('验证身份...');
-    
+
     try {
         const response = await fetch(`${API_BASE}/auth`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ username, password })
         });
-        
+
         const result = await response.json();
-        
+
         if (response.ok && result.success) {
             // 保存token和用户名到本地
             TokenManager.save(result.token, username);
+            document.getElementById('authModal').classList.remove('active');
+            resolvePendingAuth(true);  // 唤醒等待中的下载流程，自动继续
             await updateUserBar();
-            loadFileList();
-            
-            closeAuthModal();
-            document.getElementById('loadingText').textContent = '验证成功，正在下载...';
-            
-            // 使用 fetch + Authorization 头下载
-            try {
-                const downloadResponse = await fetch(`${API_BASE}/download/${fileId}`, {
-                    method: 'GET',
-                    headers: {
-                        'Authorization': `Bearer ${result.token}`
-                    }
-                });
-                if (downloadResponse.ok) {
-                    const blob = await downloadResponse.blob();
-                    const contentDisposition = downloadResponse.headers.get('Content-Disposition');
-                    let filename = 'download';
-                    if (contentDisposition) {
-                        const match = contentDisposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';\n]+)/i);
-                        if (match) filename = decodeURIComponent(match[1]);
-                    }
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = filename;
-                    document.body.appendChild(a);
-                    a.click();
-                    window.URL.revokeObjectURL(url);
-                    a.remove();
-                } else {
-                    const errResult = await downloadResponse.json();
-                    document.getElementById('authError').textContent = `下载失败: ${errResult.error || '未知错误'}`;
-                }
-            } catch (downloadError) {
-                document.getElementById('authError').textContent = `下载失败: ${downloadError.message}`;
-            } finally {
-                hideLoading();
-            }
+            await loadFileList();
+            restoreDownloadStates();
         } else if (response.status === 429) {
-            hideLoading();
             document.getElementById('authError').textContent = '请求过于频繁，请稍后再试';
         } else {
-            hideLoading();
             document.getElementById('authError').textContent = result.error || '验证失败，请检查账号密码';
         }
     } catch (error) {
-        hideLoading();
         document.getElementById('authError').textContent = `验证失败: ${error.message}`;
+    } finally {
+        hideLoading();
     }
 });
 
